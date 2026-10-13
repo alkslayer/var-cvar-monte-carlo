@@ -1,0 +1,295 @@
+---
+title: "Ryzyko portfela: VaR i CVaR metodą Monte Carlo"
+subtitle: "Portfel 5 spółek z GPW, 100 000 PLN, dane 2015-2026"
+date: today
+lang: pl
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+    code-fold: true
+    code-summary: "Pokaż kod"
+    fig-width: 9
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+source("R/config.R")
+library(knitr)
+tab <- function(f) read.csv(file.path(DIR_TAB, f), check.names = FALSE)
+fig <- function(f) knitr::include_graphics(file.path(DIR_FIG, paste0(f, ".png")))
+pln <- function(x) paste(fmt_pln(x), "PLN")
+pr  <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d, decimal.mark = ","), "%")
+num <- function(x, d = 2) formatC(x, format = "f", digits = d, decimal.mark = ",")
+
+d    <- readRDS(SCIEZKA_ZWR)
+qc   <- tab("qc_podsumowanie.csv")
+st   <- tab("02_statystyki.csv")
+w05  <- readRDS("output/05_porownanie.rds")
+w04  <- readRDS("output/04_monte_carlo.rds")
+w07  <- readRDS("output/07_garch.rds")
+v    <- function(met, a, h, m = "VaR") w05$tab[w05$tab$metoda == met & w05$tab$alfa == a & w05$tab$horyzont == h, m]
+bt   <- w07$testy
+btv  <- function(met, a, k) bt[bt$metoda == met & bt$alfa == a, k]
+```
+
+::: {.callout-warning}
+**Projekt edukacyjny.** Raport ilustruje metody pomiaru ryzyka na danych historycznych. Nie jest rekomendacją inwestycyjną ani oceną spółek.
+:::
+
+# Streszczenie
+
+- Portfel: po 20% w PKO BP, PZU, CD Projekt, KGHM i Orlen, wartość 100 000 PLN. Dane dzienne z Yahoo Finance, `r qc$od` – `r qc$do` (`r qc$dni_ze_zwrotem` sesji).
+- **Jednodniowy VaR 99%** wynosi od `r pln(v("Normalna", .99, 1))` (rozkład normalny) do `r pln(v("MC t-Student", .99, 1))` (Monte Carlo z t-Studentem). Metody różnią się niewiele przy VaR, ale bardzo przy **CVaR 99%**: normalny `r pln(v("Normalna", .99, 1, "CVaR"))`, historyczny `r pln(v("Historyczna", .99, 1, "CVaR"))`. Rozkład normalny zaniża średnią stratę w najgorszym 1% dni o około `r pr(1 - v("Normalna", .99, 1, "CVaR") / v("Historyczna", .99, 1, "CVaR"), 0)`.
+- Zwroty mają **grube ogony** (kurtoza nadwyżkowa portfela `r num(st$kurtoza_nadwyzkowa[st$seria == "Portfel"])`) i **skupiska zmienności** (silna autokorelacja kwadratów zwrotów).
+- **Horyzont 10 dni:** metody zakładające niezależne dni (normalna, MC) dają VaR 99% ok. `r pln(v("MC normalny", .99, 10))`, a historyczne 10-dniowe okna `r pln(v("Historyczna", .99, 10))`. Spadki przychodzą seriami, więc metody zakładające niezależne dni zaniżają ryzyko wielodniowe o ok. 15–20%.
+- **Backtest** (`r btv("Historyczna", .99, "dni")` dni, okno 500): przy 99% oczekujemy `r num(btv("Historyczna", .99, "oczekiwane"), 1)` przekroczeń. Normalny ma `r btv("Normalna", .99, "przekroczenia")` (test Kupca odrzuca), historyczny i MC-t po `r btv("Historyczna", .99, "przekroczenia")` (Kupiec przechodzi, ale przekroczenia tworzą skupiska: Christoffersen odrzuca). GARCH najlepiej reaguje na marzec 2020, ale jego podstawowa wersja przy 99% też ma za dużo przekroczeń.
+
+# Dane i kontrola jakości
+
+```{r}
+#| label: tab-qc
+kable(tab("qc_surowe.csv"), caption = "Surowe dane z Yahoo Finance (przed czyszczeniem)")
+```
+
+Co znalazłem i jak to obsłużyłem:
+
+1. **Sztuczne wiersze z zerowym wolumenem** (`r nrow(tab("qc_dni_wolumen_zero.csv"))` dni, wspólne dla wszystkich spółek): święta GPW do 2020 r. (Yahoo wstawiało cenę z poprzedniego dnia) oraz kilka pojedynczych dziur. Cena się w nie nie zmienia, więc usunąłem je. Zostawienie ich wstawiłoby sztuczne zerowe zwroty i zaniżyło zmienność.
+2. **Dziura na końcu próby:** 5–9.10.2026 cała seria jest płaska z zerowym wolumenem, a 12.10.2026 to niepełna sesja (brak ceny zamknięcia). Próbę kończę na **`r qc$do`**, ostatnim wiarygodnym dniu.
+3. **Splity:** Yahoo zgłasza tylko split PZU 1:10 (30.11.2015). Ceny są już o niego skorygowane (brak skoku w szeregu).
+4. **Dywidendy:** cena *Adjusted* uwzględnia dywidendy. W `r nrow(tab("qc_korekty_adjusted.csv"))` dniach zwrot z *Adjusted* różni się od zwrotu z *Close* o więcej niż 1 pp. To dni odcięcia dywidendy (PZU i Orlen co roku, PKO BP, KGHM). Bez korekty liczylibyśmy dywidendę jako stratę.
+5. **Luki między sesjami:** najdłuższa przerwa to `r qc$max_luka_dni` dni kalendarzowych. Wszystkie luki powyżej 4 dni to Wielkanoc i Boże Narodzenie.
+6. **Obserwacje odstające** (|zwrot| > 6 odchyleń standardowych) to prawdziwe zdarzenia, więc je zostawiłem:
+
+```{r}
+#| label: tab-odstajace
+o <- tab("qc_odstajace.csv"); o$ticker <- NAZWY[o$ticker]
+kontekst <- c("2020-03-12" = "COVID, krach na rynkach", "2022-02-24" = "Inwazja Rosji na Ukrainę",
+              "2022-02-25" = "Odbicie po 24.02.2022", "2020-11-09" = "Ogłoszenie skuteczności szczepionki, rajd")
+o$kontekst <- ifelse(o$data %in% names(kontekst), kontekst[o$data], "zdarzenie specyficzne dla spółki")
+kable(o, caption = "Zwroty dzienne powyżej 6 sd (opisy zdarzeń: kontekst rynkowy, nie analiza przyczyn)")
+```
+
+```{r}
+#| label: fig-ceny
+#| fig-cap: "Ceny skorygowane, indeks 100 na starcie"
+fig("01_ceny")
+```
+
+# Eksploracja zwrotów
+
+```{r}
+#| label: tab-stat
+s <- st; s[, -1] <- lapply(s[, -1], function(x) signif(x, 3))
+kable(s[, c("seria", "srednia_dzienna", "zmiennosc_roczna", "min", "max", "skosnosc", "kurtoza_nadwyzkowa", "JB_p")],
+      caption = "Statystyki dziennych zwrotów logarytmicznych")
+```
+
+Każda spółka i portfel mają ujemną skośność i kurtozę nadwyżkową wyraźnie powyżej 0. Test Jarque-Bera odrzuca normalność przy każdym rozsądnym poziomie istotności. Dywersyfikacja działa: zmienność portfela (`r pr(st$zmiennosc_roczna[st$seria == "Portfel"])` rocznie) jest niższa niż zmienność każdej spółki z osobna.
+
+::: {.panel-tabset}
+## Histogramy
+```{r}
+fig("02_histogramy")
+```
+## QQ-plot
+```{r}
+fig("02_qqplot")
+```
+## Dni poniżej −3 sd
+```{r}
+kable(tab("02_ogony.csv"), caption = "Liczba dni ze zwrotem poniżej −3 sd vs liczba oczekiwana w rozkładzie normalnym")
+```
+:::
+
+**Autokorelacja.** Same zwroty portfela prawie nie mają pamięci (Ljung-Box, 10 opóźnień: p = `r num(tab("02_ljungbox.csv")$LjungBox_lag10_p[1], 3)`), ale ich kwadraty mają silną i długą autokorelację. To typowy efekt skupisk zmienności (ARCH): po dniu dużej zmiany częściej przychodzi kolejny dzień dużej zmiany. Właśnie to założenie łamią wszystkie metody „iid” i dlatego w rozdziale 7 testuję GARCH.
+
+```{r}
+fig("02_acf")
+fig("02_zmiennosc")
+```
+
+**Korelacje.** Średnia korelacja par spółek to `r num(tab("02_korelacje_rezim.csv")$srednia_korelacja[1])`, ale w 20% dni o najwyższej zmienności (mierzonej na poprzednich 21 sesjach) rośnie do `r num(tab("02_korelacje_rezim.csv")$srednia_korelacja[3])`. Dywersyfikacja słabnie właśnie wtedy, gdy jest najbardziej potrzebna.
+
+```{r}
+#| out-width: "70%"
+fig("02_korelacje")
+```
+
+# VaR i CVaR: metoda historyczna i parametryczna
+
+Strata w PLN to $L = V\,(1 - e^{r})$, gdzie $r$ to logarytmiczny zwrot portfela w horyzoncie, a $V$ = 100 000 PLN. **VaR** na poziomie $\alpha$ to strata, której nie przekroczymy z prawdopodobieństwem $\alpha$. **CVaR** (Expected Shortfall) to średnia strata w dniach, w których VaR został przekroczony.
+
+- **Historyczna:** kwantyl empiryczny zwrotów portfela. Dla 10 dni używam zachodzących na siebie 10-dniowych okien.
+- **Parametryczna normalna:** $r_h \sim N(h\mu,\, h\sigma^2)$. CVaR liczony dokładnym wzorem dla straty $V(1-e^r)$ przy normalnym $r$.
+
+```{r}
+#| label: fig-straty
+fig("03_rozklad_strat")
+```
+
+```{r}
+#| echo: true
+#| code-fold: true
+#| code-summary: "Kod: VaR/CVaR z próby i z rozkładu normalnego (R/ryzyko.R)"
+var_cvar_probka
+var_cvar_normalny
+```
+
+# Monte Carlo
+
+Symuluję dzienne zwroty 5 spółek z zachowaniem korelacji (rozkład Choleskiego macierzy kowariancji $\Sigma = U^\top U$, $X = \mu + Z U$), liczę zwrot portfela i sumuję dni w horyzoncie. Trzy warianty:
+
+1. **MC normalny:** $Z \sim N(0, I)$. Służy jako kontrola poprawności, bo musi zbiec do wzoru parametrycznego.
+2. **MC t-Student:** wielowymiarowy rozkład t ze wspólnym mianownikiem $\sqrt{(\nu-2)/W}$, $W\sim\chi^2_\nu$. Krach dotyka wtedy wszystkich spółek naraz (zależność w ogonach), a kowariancja dalej równa się $\Sigma$. Stopnie swobody $\nu$ estymuję metodą największej wiarygodności: **ν = `r num(w04$nu)`**.
+3. **MC bootstrap:** losowanie całych historycznych dni ze zwracaniem. Zachowuje rzeczywiste ogony i korelacje, ale nie zachowuje kolejności dni.
+
+```{r}
+kable(w04$nu_tab, caption = "Stopnie swobody t-Studenta (MLE): wielowymiarowy i jednowymiarowe")
+```
+
+Wszystkie symulacje są wektorowe: jedna macierz $n \cdot h \times 5$ i mnożenie macierzy, bez pętli po scenariuszach. Ziarno: `set.seed(`r SEED`)`, $N$ = `r fmt_pln(N_SIM)`.
+
+```{r}
+#| echo: true
+#| code-summary: "Kod: symulacja t-Studenta (R/mc.R)"
+sim_mc_t
+```
+
+**Kontrola poprawności.** Przy $10^6$ symulacji MC normalny trafia we wzór parametryczny, a MC-t w dokładny kwantyl rozkładu t. Portfel z wielowymiarowego t o wspólnym ν ma bowiem jednowymiarowy rozkład t. Błędy są poniżej 1%:
+
+```{r}
+k <- w04$kontrola; k[, 4:9] <- lapply(k[, 4:9], round, 2)
+kable(k, caption = "MC (10^6 symulacji) vs wartość dokładna; błąd w %")
+```
+
+```{r}
+#| label: fig-zbieznosc
+fig("04_zbieznosc")
+fig("04_blad_mc")
+```
+
+CVaR zbiega wolniej niż VaR, bo zależy od kilku najbardziej skrajnych scenariuszy. Przy 99% potrzeba ok. 10^4^–10^5^ symulacji, żeby błąd spadł do ~1%. Błąd maleje jak $1/\sqrt{N}$: dziesięć razy dokładniej oznacza sto razy więcej symulacji.
+
+# Porównanie metod
+
+```{r}
+#| label: tab-porownanie
+sz <- w05$szeroka
+kable(sz, format.args = list(big.mark = " "),
+      caption = "VaR i CVaR [PLN] dla portfela 100 000 PLN (kolumny: miara_poziom_horyzont)")
+```
+
+```{r}
+fig("05_porownanie")
+fig("05_wrazliwosc_alfa")
+fig("05_wrazliwosc_horyzont")
+```
+
+**Wnioski z porównania**
+
+- Przy 95% wszystkie metody dają prawie to samo (`r pln(min(sz$VaR_95_1d))`–`r pln(max(sz$VaR_95_1d))`). Wybór metody ma znaczenie dopiero w ogonie.
+- Przy 99% rozkład normalny zaniża VaR o kilka procent, a **CVaR o ~`r pr(1 - v("Normalna", .99, 1, "CVaR") / v("Historyczna", .99, 1, "CVaR"), 0)`**. MC-t i bootstrap odtwarzają gruby ogon.
+- Przy 10 dniach metody MC (t, bootstrap) zbliżają się do normalnej, bo suma 10 niezależnych dni „normalnieje” (CLT). Historyczne 10-dniowe straty są wyższe, bo dni nie są niezależne: spadki przychodzą seriami. Lepszy model niezależnych dni tego nie naprawi, potrzebny jest model zmiennej zmienności.
+
+# Backtest (okno kroczące 500 dni)
+
+Dla każdego dnia $t$ od `r format(as.Date(readRDS("output/06_backtest_prognozy.rds")$data[1]))` liczę VaR 1-dniowy **wyłącznie z 500 poprzednich dni** ($t-500, \dots, t-1$). Przekroczenie to dzień, w którym rzeczywisty zwrot był niższy niż prognozowany kwantyl. Brak look-ahead bias sprawdzam w kodzie dwoma sposobami: (1) po „zepsuciu” danych od dnia 1500 prognozy na wcześniejsze dni są bit w bit identyczne, (2) liczby przekroczeń i statystyki LR zgadzają się z `rugarch::VaRTest`.
+
+- **Test Kupca (POF):** czy odsetek przekroczeń jest równy $1-\alpha$.
+- **Test Christoffersena:** czy przekroczenia są niezależne (nie tworzą skupisk) oraz test łączny (*conditional coverage*).
+
+```{r}
+#| label: tab-bt
+b <- bt[, c("metoda", "alfa", "dni", "przekroczenia", "oczekiwane", "p_uc", "n11", "p_ind", "p_cc", "sredni_VaR_PLN")]
+b$p_uc <- round(b$p_uc, 3); b$p_ind <- round(b$p_ind, 3); b$p_cc <- round(b$p_cc, 4)
+b$oczekiwane <- round(b$oczekiwane, 1); b$sredni_VaR_PLN <- round(b$sredni_VaR_PLN)
+names(b) <- c("metoda", "alfa", "dni", "przekr.", "oczek.", "p Kupiec", "przekr. dzień po dniu",
+              "p niezależność", "p łączny", "śr. VaR [PLN]")
+kable(b, caption = "Backtest VaR 1-dniowego, wszystkie metody (p < 0,05 = model odrzucony)")
+```
+
+```{r}
+fig("06_backtest")
+```
+
+**Interpretacja**
+
+- **Normalna 99%:** `r btv("Normalna", .99, "przekroczenia")` przekroczeń zamiast ~24. Test Kupca odrzuca (p = `r num(btv("Normalna", .99, "p_uc"), 3)`). Rozkład normalny ma za cienkie ogony.
+- **Historyczna i MC-t 99%:** liczba przekroczeń jest do przyjęcia (Kupiec p = `r num(btv("Historyczna", .99, "p_uc"), 2)`), ale przekroczenia przychodzą seriami (Christoffersen odrzuca niezależność). Model ma dobrą średnią, ale zły moment: w spokojnych okresach przeszacowuje ryzyko, a w kryzysie je zaniża.
+- **Przy 95%** wszystkie metody przechodzą test Kupca. Wtedy liczy się głównie środek rozkładu, a nie ogon.
+
+## Okres stresu: marzec 2020
+
+```{r}
+#| label: tab-stres
+s <- w07$stres; s$p_dwumian <- signif(s$p_dwumian, 2); s$VaR_srednio_PLN <- round(s$VaR_srednio_PLN)
+kable(s, caption = "Marzec 2020: przekroczenia VaR (oczekiwane przy poprawnym modelu: 0,22 dla 99%, 1,1 dla 95%)")
+```
+
+```{r}
+fig("07_marzec2020")
+```
+
+W marcu 2020 r. wszystkie modele bez zmiennej zmienności miały 4–5 przekroczeń VaR 99% w 22 sesjach (oczekiwane 0,22). Okno 500 dni zawiera prawie wyłącznie spokojny okres, więc jeden krach prawie nie zmienia kwantyla. VaR historyczny skoczył dopiero wtedy, gdy krach z 12.03 sam znalazł się w oknie.
+
+# Rozszerzenie: GARCH(1,1)
+
+Model $\sigma_t^2 = \omega + \alpha\,\varepsilon_{t-1}^2 + \beta\,\sigma_{t-1}^2$ (pakiet `rugarch`) z innowacjami normalnymi lub t-Studenta. Estymacja w tym samym oknie kroczącym 500 dni, reestymacja co `r REFIT_CO` dni (`ugarchroll`, `refit.window = "moving"`). Między reestymacjami zmienność aktualizuje się codziennie nowymi danymi, ale parametry pozostają stałe. W kodzie sprawdzam, że każde okno estymacji kończy się przed pierwszym dniem, na który model prognozuje.
+
+```{r}
+fig("07_garch_vs_hist")
+```
+
+```{r}
+kable(w07$lata, caption = "Przekroczenia VaR 99% w podziale na lata")
+```
+
+**Co daje GARCH**
+
+- W marcu 2020 GARCH miał 3 przekroczenia zamiast 4–5, a jego VaR 99% wzrósł w ciągu kilku dni do ponad 10 000 PLN. Na tym polega wartość zmiennej zmienności: model ostrzega już w trakcie kryzysu, a nie dopiero po nim.
+- Przy 95% GARCH ma najwyższe p-wartości testu niezależności (`r num(btv("GARCH-norm", .95, "p_ind"))` i `r num(btv("GARCH-t", .95, "p_ind"))`), a model normalny bez GARCH jest w tym teście odrzucany. Przekroczenia przestają się grupować.
+- Przy 99% podstawowy GARCH(1,1)-t ma jednak `r btv("GARCH-t", .99, "przekroczenia")` przekroczeń (Kupiec p = `r num(btv("GARCH-t", .99, "p_uc"), 3)`). Średnio jest niższy niż VaR historyczny, bo w spokojnych latach szybko „zapomina” o ryzyku. Dodatkowo estymowana średnia dzienna z hossy (np. 2025–2026) obniża prognozowany kwantyl.
+
+**Odporność specyfikacji GARCH-t** (wariant główny ustalony z góry: sGARCH ze stałą w średniej):
+
+```{r}
+o <- w07$odpornosc; o$p_kupiec <- round(o$p_kupiec, 3); o$p_christoffersen_cc <- round(o$p_christoffersen_cc, 3)
+kable(o, caption = "Warianty GARCH-t w backteście")
+```
+
+Oba warianty asymetrycznego GJR-GARCH (spadki zwiększają zmienność mocniej niż wzrosty) przechodzą testy Kupca i Christoffersena na obu poziomach przy α = 5%. Najlepiej wypada wariant bez stałej w średniej. Ten wariant wybrałem jednak *po* obejrzeniu wyników, więc traktuję go jako wskazówkę do dalszej pracy, a nie dowód.
+
+**Bieżąca prognoza GARCH-t** (ostatnie 500 dni, stan na `r qc$do`):
+
+```{r}
+g <- w07$garch_now; g_tab <- g; g_tab$VaR <- round(g$VaR); g_tab$CVaR <- round(g$CVaR)
+g_tab$VaR <- round(g$VaR)
+g_tab$sigma_dzienna_teraz <- pr(g$sigma_dzienna_teraz, 2); g_tab$sigma_dzienna_dlugookresowa <- pr(g$sigma_dzienna_dlugookresowa, 2)
+kable(g_tab, caption = "GARCH-t: VaR/CVaR na kolejny dzień i 10 dni (10 dni: 50 000 symulowanych ścieżek GARCH)")
+```
+
+Bieżąca zmienność (`r pr(g$sigma_dzienna_teraz[1], 2)` dziennie) jest niższa niż poziom długookresowy wynikający z parametrów modelu i niż średnia z 2015–2026 (`r pr(st$sd_dzienne[st$seria == "Portfel"], 2)`), więc GARCH podaje dziś *niższy* VaR niż metody statyczne. To zgodne z modelem, ale niesie ryzyko: niska zmienność potrafi się skończyć z dnia na dzień.
+
+# Ograniczenia
+
+- **Przeszłość ≠ przyszłość.** Wszystkie metody estymują ryzyko z historii 2015–2026 (lub z ostatnich 500 dni). Szok spoza próby (np. ryzyko regulacyjne spółek Skarbu Państwa) nie jest w nich uwzględniony.
+- **Zwrot portfela jako $w^\top r$** (średnia ważona zwrotów log) to przybliżenie dokładnego zwrotu portfela o stałych wagach. Dla 1 dnia VaR 99% z przybliżenia jest wyższy o `r pln(readRDS("output/03_var_klasyczny.rds")$roznica_aproksymacji)` (ok. 1%), czyli przybliżenie jest lekko konserwatywne.
+- **Założenie iid** w metodach historycznej, normalnej i MC. Kwadraty zwrotów są silnie autokorelowane, więc wielodniowy VaR z tych metod jest zaniżony (patrz porównanie 10 dni).
+- **Stała korelacja.** W kryzysie korelacje rosną (`r num(tab("02_korelacje_rezim.csv")$srednia_korelacja[2])` → `r num(tab("02_korelacje_rezim.csv")$srednia_korelacja[3])`), a żaden z modeli tego nie modeluje (potrzebny byłby np. DCC-GARCH lub kopuły).
+- **Wspólne ν w MC-t** wymusza ten sam „ogon” dla wszystkich spółek, choć CD Projekt ma wyraźnie grubszy ogon (ν ≈ 3,5) niż pozostałe.
+- **Historyczne okna 10-dniowe nakładają się,** więc obserwacje nie są niezależne. Efektywna liczba niezależnych obserwacji jest ok. 10 razy mniejsza.
+- **Dane Yahoo Finance:** brak oficjalnego źródła GPW do porównania (stooq blokuje pobieranie automatyczne), więc ceny skorygowane zależą od metody korekty Yahoo. Nie uwzględniam kosztów transakcyjnych, płynności ani podatków.
+- **Backtest 1-dniowy:** testuję tylko VaR 1-dniowy. CVaR i VaR 10-dniowy nie mają tu formalnego backtestu.
+- Wariant GJR-GARCH, który wypadł najlepiej, wybrałem po obejrzeniu danych (ryzyko przeuczenia).
+
+::: {.callout-warning}
+Projekt edukacyjny. Wyniki nie stanowią rekomendacji inwestycyjnej.
+:::
